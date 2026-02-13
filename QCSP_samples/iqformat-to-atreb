@@ -1,0 +1,123 @@
+"""
+Lee un .mat con IQ (float/complex), cuantiza a 14 bits (signed) y guarda otro .mat.
+
+Soporta estas entradas típicas dentro del .mat:
+1) iq : vector complejo (complex64/complex128)  -> I=real(iq), Q=imag(iq)
+2) I  y Q : vectores reales separados
+3) i  y q : igual que arriba (nombres alternativos)
+
+Salida .mat:
+- I14_int16 : I cuantizado (int16, rango [-8192..8191])
+- Q14_int16 : Q cuantizado (int16, rango [-8192..8191])
+- scale_used : escala aplicada (float)
+- bits : 14
+"""
+
+import numpy as np
+from scipy.io import loadmat, savemat
+
+
+def _find_key(d: dict, candidates):
+    for k in candidates:
+        if k in d:
+            return k
+    return None
+
+
+def quantize_to_int14(x: np.ndarray, scale: float | None = None):
+    """
+    x: float array (típicamente en [-1,1] o parecido)
+    scale:
+      - None  -> autoescala: usa el pico máximo para mapear a 8191 sin saturar
+      - valor -> escala fija, ej: 8191 si x ya está en [-1,1]
+    """
+    x = np.asarray(x, dtype=np.float64)
+
+    if scale is None:
+        peak = np.max(np.abs(x)) if x.size else 1.0
+        peak = float(peak) if peak > 0 else 1.0
+        scale_used = 8191.0 / peak
+    else:
+        scale_used = float(scale)
+
+    y = np.round(x * scale_used)
+
+    # rango signed 14-bit: [-8192, 8191]
+    y = np.clip(y, -8192, 8191).astype(np.int16)
+    return y, scale_used
+
+
+def main(
+    in_mat: str = "frame.mat",
+    out_mat: str = "iq_14_format.mat",
+    scale: float | None = None,
+):
+    d = loadmat(in_mat)
+
+    # Intento 1: iq complejo
+    k_iq = _find_key(d, ["iq", "IQ", "tx_samples", "samples", "iq_samples"])
+    if k_iq is not None:
+        iq = np.asarray(d[k_iq]).squeeze()
+        if np.iscomplexobj(iq):
+            I = np.real(iq)
+            Q = np.imag(iq)
+        else:
+            # Si viene como Nx2 (I,Q)
+            if iq.ndim == 2 and iq.shape[1] == 2:
+                I = iq[:, 0]
+                Q = iq[:, 1]
+            else:
+                raise ValueError(
+                    f"Encontré '{k_iq}' pero no es complejo ni Nx2. Shape={iq.shape}, dtype={iq.dtype}"
+                )
+    else:
+        # Intento 2: I y Q separados
+        k_I = _find_key(d, ["I", "i", "I_samples", "i_samples", "real"])
+        k_Q = _find_key(d, ["Q", "q", "Q_samples", "q_samples", "imag"])
+        if k_I is None or k_Q is None:
+            raise ValueError(
+                "No encontré IQ en el .mat. Esperaba 'iq' complejo o pares ('I'/'Q', 'i'/'q')."
+            )
+        I = np.asarray(d[k_I]).squeeze()
+        Q = np.asarray(d[k_Q]).squeeze()
+
+    if I.shape != Q.shape:
+        raise ValueError(f"I y Q tienen shapes diferentes: I={I.shape}, Q={Q.shape}")
+
+    # Cuantización a 14 bits (misma escala para I y Q)
+    # Si scale=None: autoescala usando el máximo de |I| y |Q|
+    if scale is None:
+        peak = max(float(np.max(np.abs(I))), float(np.max(np.abs(Q))), 1e-12)
+        scale_used = 8191.0 / peak
+    else:
+        scale_used = float(scale)
+
+    I14, _ = quantize_to_int14(I, scale_used)
+    Q14, _ = quantize_to_int14(Q, scale_used)
+
+    out = {
+        "I14_int16": I14,
+        "Q14_int16": Q14,
+        "scale_used": np.array([scale_used], dtype=np.float64),
+        "bits": np.array([14], dtype=np.int32),
+    }
+
+    savemat(out_mat, out, do_compression=True)
+
+    print("[OK] Convertido a int14 y guardado.")
+    print(f"     in : {in_mat}")
+    print(f"     out: {out_mat}")
+    print(f"     N  : {I14.size} muestras (I y Q)")
+    print(f"     scale_used: {scale_used:.6f}")
+    print("     rango I14:", int(I14.min()), "a", int(I14.max()))
+    print("     rango Q14:", int(Q14.min()), "a", int(Q14.max()))
+
+
+if __name__ == "__main__":
+    # Ejemplos de uso:
+    # 1) Autoescala:
+    #    python mat_to_int14.py
+    #
+    # 2) Escala fija si ya sabes que tus IQ están en [-1, 1]:
+    #    main("input.mat", "out.mat", scale=8191.0)
+    main()
